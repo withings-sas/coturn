@@ -59,6 +59,16 @@ struct _Ryconninfo {
 
 typedef struct _Ryconninfo Ryconninfo;
 
+
+struct redisClusterConnection {
+	redisContext *redisconnection;
+	char ip[1024];
+	int port;
+};
+
+//typedef struct _redisClusterConnection redisClusterConnection;
+
+
 static void RyconninfoFree(Ryconninfo *co) {
 	if(co) {
 		if(co->host) turn_free(co->host, strlen(co->host)+1);
@@ -280,107 +290,98 @@ static redisContext *_redisConnect(Ryconninfo *co, char *ip, int port) {
 	return redisconnection;
 }
 
-static redisContext *get_redis_connection(const char *force_ip, int force_port) {
+static redisContext *get_redis_connection(char *ip, int port) {
+	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: get_redis_connection [%s:%d]\n", ip, port);
 	persistent_users_db_t *pud = get_persistent_users_db();
 
-	int port = DEFAULT_REDIS_PORT;
 	char *errmsg = NULL;
 	Ryconninfo *co = RyconninfoParse(pud->userdb, &errmsg);
-	if( force_port > 0 ) {
-		port = force_port;
-	} else {
-		if (co->port) {
-			port = (int) (co->port);
+
+	struct redisClusterConnection *rccs = (struct redisClusterConnection*)pthread_getspecific(connection_key);
+	int max_connections = 30;
+	if( !rccs ) {
+		unsigned long rc_size = sizeof(struct redisClusterConnection) * max_connections;
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Allocating %u bytes\n", rc_size);
+		rccs = malloc(rc_size);
+		memset(rccs, 0, rc_size);
+	}
+	int i;
+	int rcc_index;
+	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Browse connections to find existing\n");
+	struct redisClusterConnection rcc;
+	redisContext *redisconnection = NULL;
+	for( i=0; i<max_connections; i++ ) {
+		rcc = rccs[i];
+		if( strcmp(rcc.ip, ip) == 0 && rcc.port == port ) {
+			// Found match
+			rcc_index = i;
+			TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Found match at:[%d]\n", rcc_index);
+			redisconnection = rcc.redisconnection;
+			break;
+		}
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Connection\n");
+		if( rcc.port == 0 ) {
+			// Next slot
+			rcc_index = i;
+			TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Select new slot at:[%d]\n", rcc_index);
+			break;
 		}
 	}
-	int min_port = 6379;
-	int max_port = 7050;
-	if( port < min_port || port >= max_port ) {
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: Unsupported port %d. range:[%d-%d]\n", port, min_port, max_port);
+	if( rcc_index == max_connections - 1 ) {
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Not enough slot:[%d/%d]\n", rcc_index, max_connections);
 		return NULL;
 	}
-
-	redisContext **redisconnections = (redisContext**)pthread_getspecific(connection_key);
-	// redisconnections is a list, in which the key is the port
-	// we use the fact that each ports *must* be different between node
-	// this is ugly, yes, but simple and efficient
-	// (except it uselessly uses ~100kb of memory and we need to restrict port range)
-	if( !redisconnections ) {
-		unsigned long rc_size = sizeof(redisContext) * (max_port - min_port);
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Allocating %u kb\n", rc_size/1000);
-		redisconnections = malloc(rc_size);
-		memset(redisconnections, 0, rc_size);
+	if( redisconnection == NULL ) {
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Write new slot at:[%d]\n", rcc_index);
+		rccs[rcc_index].redisconnection = redisconnection;
+		strcpy(rccs[rcc_index].ip, ip);
+		rccs[rcc_index].port = port;
 	}
-	redisContext *redisconnection = redisconnections[port + min_port];
 
 	if(redisconnection) {
-		//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: reuse connection for forced host:[%s] port:[%d] redisconnection:[%u]\n", force_ip, port, redisconnection);
+		//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: reuse connection for forced host:[%s] port:[%d] redisconnection:[%u]\n", ip, port, redisconnection);
 		if(redisconnection->err) {
 			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot connect to redis, err=%d, flags=0x%lx\n", __FUNCTION__,(int)redisconnection->err,(unsigned long)redisconnection->flags);
 			redisFree(redisconnection);
 			redisconnection = NULL;
-			redisconnections[port + min_port] = redisconnection;
-			(void) pthread_setspecific(connection_key, redisconnections);
+			rccs[rcc_index].redisconnection = redisconnection;
+			rccs[rcc_index].port = 0;
+			(void) pthread_setspecific(connection_key, rccs);
 		}
 	}
 
 	if (!redisconnection) {
-		//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: need a new connection for forced host:[%s] port:[%d]\n", force_ip, port);
+		//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: need a new connection for forced host:[%s] port:[%d]\n", ip, port);
 
-		if (!co) {
-			if (errmsg) {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Redis DB connection <%s>, connection string format error: %s\n", pud->userdb, errmsg);
-				turn_free(errmsg,strlen(errmsg)+1);
-			} else {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Redis DB connection <%s>, connection string format error\n", pud->userdb);
-			}
-		} else if (errmsg) {
-			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Redis DB connection <%s>, connection string format error: %s\n", pud->userdb, errmsg);
-			turn_free(errmsg,strlen(errmsg)+1);
-			RyconninfoFree(co);
-		} else {
-			char ip[256] = "\0";
-			if( strcmp(force_ip, "") != 0 ) {
-				STRCPY(ip, force_ip);
-			} else {
-				if (co->host) {
-					STRCPY(ip,co->host);
+		redisconnection = _redisConnect(co, ip, port);
+
+		if (redisconnection) {
+			if(redisconnection->err) {
+				if(redisconnection->errstr[0]) {
+					TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: %s\n",redisconnection->errstr);
 				}
-				if (!ip[0]) {
-					STRCPY(ip,"127.0.0.1");
-				}
-			}
-
-			redisconnection = _redisConnect(co, ip, port);
-
-			if (redisconnection) {
-				if(redisconnection->err) {
-					if(redisconnection->errstr[0]) {
+				redisFree(redisconnection);
+				redisconnection = NULL;
+			} else if (co->password) {
+				void *reply = redisCommand(redisconnection, "AUTH %s", co->password);
+				if(!reply) {
+					if(redisconnection->err && redisconnection->errstr[0]) {
 						TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: %s\n",redisconnection->errstr);
 					}
 					redisFree(redisconnection);
 					redisconnection = NULL;
-				} else if (co->password) {
-					void *reply = redisCommand(redisconnection, "AUTH %s", co->password);
-					if(!reply) {
-						if(redisconnection->err && redisconnection->errstr[0]) {
-							TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: %s\n",redisconnection->errstr);
-						}
-						redisFree(redisconnection);
-						redisconnection = NULL;
-					} else {
-						turnFreeRedisReply(reply);
-						if (co->dbname) {
-							reply = redisCommand(redisconnection, "select %s", co->dbname);
-							if(!reply) {
-								if(redisconnection->err && redisconnection->errstr[0]) {
-									TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: %s\n",redisconnection->errstr);
-								}
-								redisFree(redisconnection);
-								redisconnection = NULL;
-							} else {
-								turnFreeRedisReply(reply);
+				} else {
+					turnFreeRedisReply(reply);
+					if (co->dbname) {
+						reply = redisCommand(redisconnection, "select %s", co->dbname);
+						if(!reply) {
+							if(redisconnection->err && redisconnection->errstr[0]) {
+								TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: %s\n",redisconnection->errstr);
 							}
+							redisFree(redisconnection);
+							redisconnection = NULL;
+						} else {
+							turnFreeRedisReply(reply);
 						}
 					}
 				}
@@ -396,11 +397,52 @@ static redisContext *get_redis_connection(const char *force_ip, int force_port) 
 			RyconninfoFree(co);
 		}
 		if(redisconnection) {
-			redisconnections[port + min_port] = redisconnection;
-			(void) pthread_setspecific(connection_key, redisconnections);
+			rccs[rcc_index].redisconnection = redisconnection;
+			(void) pthread_setspecific(connection_key, rccs);
 		}
 	}
 
+	return redisconnection;
+}
+
+static redisContext *get_redis_default_connection(void) {
+	persistent_users_db_t *pud = get_persistent_users_db();
+
+	char *errmsg = NULL;
+	Ryconninfo *co = RyconninfoParse(pud->userdb, &errmsg);
+
+	redisContext *redisconnection;
+
+	if (!co) {
+		if (errmsg) {
+			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Redis DB connection <%s>, connection string format error: %s\n", pud->userdb, errmsg);
+			turn_free(errmsg,strlen(errmsg)+1);
+		} else {
+			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Redis DB connection <%s>, connection string format error\n", pud->userdb);
+		}
+		redisconnection = NULL;
+	} else if (errmsg) {
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Redis DB connection <%s>, connection string format error: %s\n", pud->userdb, errmsg);
+		turn_free(errmsg,strlen(errmsg)+1);
+		RyconninfoFree(co);
+		redisconnection = NULL;
+	} else {
+		char ip[256] = "\0";
+		int port = DEFAULT_REDIS_PORT;
+
+		if (co->host) {
+			STRCPY(ip,co->host);
+		}
+		if (!ip[0]) {
+			STRCPY(ip,"127.0.0.1");
+		}
+
+		if (co->port) {
+			port = (int) (co->port);
+		}
+
+		redisconnection = get_redis_connection(ip, port);
+	}
 	return redisconnection;
 }
 
@@ -481,7 +523,7 @@ static int set_redis_realm_opt(char *realm, const char* key, unsigned long *valu
 	return found;
 
 	/*
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 
 	if(rc) {
 		redisReply *rget = NULL;
@@ -516,7 +558,7 @@ static int set_redis_realm_opt(char *realm, const char* key, unsigned long *valu
 static int redis_get_auth_secrets(secrets_list_t *sl, u08bits *realm)
 {
 	int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 		redisReply *reply = (redisReply*) redisCommand(rc, "smembers turn/realm/%s/secret", (char*) realm);
 		if (reply) {
@@ -543,7 +585,7 @@ static int redis_get_auth_secrets(secrets_list_t *sl, u08bits *realm)
   
 static int redis_get_user_key(u08bits *usname, u08bits *realm, hmackey_t key) {
   int ret = -1;
-	redisContext * rc = get_redis_connection("", 0);
+	redisContext * rc = get_redis_default_connection();
 	if(rc) {
 		char s[TURN_LONG_STRING_SIZE];
 		snprintf(s,sizeof(s),"get turn/realm/%s/user/%s/key", (char*)realm, usname);
@@ -573,7 +615,7 @@ static int redis_get_user_key(u08bits *usname, u08bits *realm, hmackey_t key) {
 
 static int redis_get_oauth_key(const u08bits *kid, oauth_key_data_raw *key) {
   int ret = -1;
-  redisContext * rc = get_redis_connection("", 0);
+  redisContext * rc = get_redis_default_connection();
   if(rc) {
 	char s[TURN_LONG_STRING_SIZE];
 	ns_bzero(key,sizeof(oauth_key_data_raw));
@@ -615,7 +657,7 @@ static int redis_get_oauth_key(const u08bits *kid, oauth_key_data_raw *key) {
   
 static int redis_set_user_key(u08bits *usname, u08bits *realm, const char *key) {
   int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char statement[TURN_LONG_STRING_SIZE];
 		snprintf(statement,sizeof(statement),"set turn/realm/%s/user/%s/key %s",(char*)realm,usname,key);
@@ -628,7 +670,7 @@ static int redis_set_user_key(u08bits *usname, u08bits *realm, const char *key) 
 
 static int redis_set_oauth_key(oauth_key_data_raw *key) {
   int ret = -1;
-  redisContext *rc = get_redis_connection("", 0);
+  redisContext *rc = get_redis_default_connection();
   if(rc) {
 	char statement[TURN_LONG_STRING_SIZE];
 	snprintf(statement,sizeof(statement),"hmset turn/oauth/kid/%s ikm_key %s as_rs_alg %s timestamp %llu lifetime %lu realm %s",
@@ -642,7 +684,7 @@ static int redis_set_oauth_key(oauth_key_data_raw *key) {
   
 static int redis_del_user(u08bits *usname, u08bits *realm) {
   int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char statement[TURN_LONG_STRING_SIZE];
 		{
@@ -658,7 +700,7 @@ static int redis_del_user(u08bits *usname, u08bits *realm) {
 
 static int redis_del_oauth_key(const u08bits *kid) {
   int ret = -1;
-  redisContext *rc = get_redis_connection("", 0);
+  redisContext *rc = get_redis_default_connection();
   if(rc) {
 	char statement[TURN_LONG_STRING_SIZE];
 	snprintf(statement,sizeof(statement),"del turn/oauth/kid/%s",(const char*)kid);
@@ -672,7 +714,7 @@ static int redis_del_oauth_key(const u08bits *kid) {
 static int redis_list_users(u08bits *realm, secrets_list_t *users, secrets_list_t *realms)
 {
 	int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 
 	u08bits realm0[STUN_MAX_REALM_SIZE+1] = "\0";
 	if(!realm) realm=realm0;
@@ -750,7 +792,7 @@ static int redis_list_users(u08bits *realm, secrets_list_t *users, secrets_list_
 
 static int redis_list_oauth_keys(secrets_list_t *kids,secrets_list_t *teas,secrets_list_t *tss,secrets_list_t *lts,secrets_list_t *realms) {
   int ret = -1;
-  redisContext *rc = get_redis_connection("", 0);
+  redisContext *rc = get_redis_default_connection();
   secrets_list_t keys;
   size_t isz = 0;
   init_secrets_list(&keys);
@@ -821,7 +863,7 @@ static int redis_list_secrets(u08bits *realm, secrets_list_t *secrets, secrets_l
 	if(!realm) realm=realm0;
 
 	donot_print_connection_success = 1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 		redisReply *reply = NULL;
 		if (realm && realm[0]) {
@@ -908,7 +950,7 @@ static int redis_del_secret(u08bits *secret, u08bits *realm)
 {
 	int ret = -1;
 	donot_print_connection_success = 1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 		turnFreeRedisReply(redisCommand(rc, "srem turn/realm/%s/secret %s", (char*) realm, (char*) secret));
 		turnFreeRedisReply(redisCommand(rc, "save"));
@@ -922,7 +964,7 @@ static int redis_set_secret(u08bits *secret, u08bits *realm)
 {
 	int ret = -1;
 	donot_print_connection_success = 1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 		char s[TURN_LONG_STRING_SIZE];
 
@@ -946,7 +988,7 @@ static int redis_set_permission_ip(const char *kind, u08bits *realm, const char*
 
 	donot_print_connection_success = 1;
 
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 		char s[TURN_LONG_STRING_SIZE];
 
@@ -965,7 +1007,7 @@ static int redis_set_permission_ip(const char *kind, u08bits *realm, const char*
   
 static int redis_add_origin(u08bits *origin, u08bits *realm) {
   int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char s[TURN_LONG_STRING_SIZE];
 
@@ -980,7 +1022,7 @@ static int redis_add_origin(u08bits *origin, u08bits *realm) {
   
 static int redis_del_origin(u08bits *origin) {
   int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char s[TURN_LONG_STRING_SIZE];
 
@@ -1002,7 +1044,7 @@ static int redis_list_origins(u08bits *realm, secrets_list_t *origins, secrets_l
 
 	donot_print_connection_success = 1;
 
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		secrets_list_t keys;
 		size_t isz = 0;
@@ -1067,7 +1109,7 @@ static int redis_list_origins(u08bits *realm, secrets_list_t *origins, secrets_l
   
 static int redis_set_realm_option_one(u08bits *realm, unsigned long value, const char* opt) {
   int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char s[TURN_LONG_STRING_SIZE];
 
@@ -1086,7 +1128,7 @@ static int redis_set_realm_option_one(u08bits *realm, unsigned long value, const
 static int redis_list_realm_options(u08bits *realm) {
   int ret = -1;
 	donot_print_connection_success = 1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		secrets_list_t keys;
 		size_t isz = 0;
@@ -1149,7 +1191,7 @@ static int redis_list_realm_options(u08bits *realm) {
 }
   
 static void redis_auth_ping(void * rch) {
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		turnFreeRedisReply(redisCommand(rc, "keys turn/origin/*"));
 	}
@@ -1162,7 +1204,7 @@ static void redis_auth_ping(void * rch) {
 static int redis_get_ip_list(const char *kind, ip_range_list_t * list)
 {
 	int ret = -1;
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 		char statement[TURN_LONG_STRING_SIZE];
 		const char* header = "turn/realm/";
@@ -1235,7 +1277,7 @@ static int redis_get_ip_list(const char *kind, ip_range_list_t * list)
 }
   
 static void redis_reread_realms(secrets_list_t * realms_list) {
-	redisContext *rc = get_redis_connection("", 0);
+	redisContext *rc = get_redis_default_connection();
 	if (rc) {
 
 		redisReply *reply = (redisReply*) redisCommand(rc, "keys turn/origin/*");
@@ -1343,7 +1385,7 @@ static void redis_reread_realms(secrets_list_t * realms_list) {
 static int redis_get_admin_user(const u08bits *usname, u08bits *realm, password_t pwd)
 {
 	int ret = -1;
-	redisContext * rc = get_redis_connection("", 0);
+	redisContext * rc = get_redis_default_connection();
 	if(rc) {
 		char s[TURN_LONG_STRING_SIZE];
 		realm[0]=0;
@@ -1381,7 +1423,7 @@ static int redis_set_admin_user(const u08bits *usname, const u08bits *realm, con
 {
   int ret = -1;
   donot_print_connection_success = 1;
-  redisContext *rc = get_redis_connection("", 0);
+  redisContext *rc = get_redis_default_connection();
   if(rc) {
 	char statement[TURN_LONG_STRING_SIZE];
 	if(realm[0]) {
@@ -1399,7 +1441,7 @@ static int redis_set_admin_user(const u08bits *usname, const u08bits *realm, con
 static int redis_del_admin_user(const u08bits *usname) {
   int ret = -1;
   donot_print_connection_success = 1;
-  redisContext *rc = get_redis_connection("", 0);
+  redisContext *rc = get_redis_default_connection();
   if(rc) {
 	char statement[TURN_LONG_STRING_SIZE];
 	snprintf(statement,sizeof(statement),"del turn/admin_user/%s",(const char*)usname);
@@ -1414,7 +1456,7 @@ static int redis_list_admin_users(int no_print)
 {
   int ret = -1;
   donot_print_connection_success = 1;
-  redisContext *rc = get_redis_connection("", 0);
+  redisContext *rc = get_redis_default_connection();
   secrets_list_t keys;
   size_t isz = 0;
   init_secrets_list(&keys);
