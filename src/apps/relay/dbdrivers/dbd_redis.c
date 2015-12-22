@@ -268,7 +268,7 @@ redis_context_handle get_redis_async_connection(struct event_base *base, const c
 
 static redisContext *_redisConnect(Ryconninfo *co, char *ip, int port) {
 	redisContext *redisconnection;
-	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "CONNECTION TO [%s:%d]\n", ip, port);
+	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Connection to [%s:%d]\n", ip, port);
 	if (co->connect_timeout) {
 		struct timeval tv;
 		tv.tv_usec = 0;
@@ -277,12 +277,12 @@ static redisContext *_redisConnect(Ryconninfo *co, char *ip, int port) {
 	} else {
 		redisconnection = redisConnect(ip, port);
 	}
-	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "CONNECTION DONE\n");
 	return redisconnection;
 }
 
 static redisContext *get_redis_connection(const char *force_ip, int force_port) {
 	persistent_users_db_t *pud = get_persistent_users_db();
+
 	int port = DEFAULT_REDIS_PORT;
 	char *errmsg = NULL;
 	Ryconninfo *co = RyconninfoParse(pud->userdb, &errmsg);
@@ -294,13 +294,17 @@ static redisContext *get_redis_connection(const char *force_ip, int force_port) 
 		}
 	}
 	int min_port = 6379;
-	int max_port = 7100;
+	int max_port = 7050;
 	if( port < min_port || port >= max_port ) {
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: Unsupported port %d. range:[%d-%d]\n", port, min_port, max_port);
 		return NULL;
 	}
 
 	redisContext **redisconnections = (redisContext**)pthread_getspecific(connection_key);
+	// redisconnections is a list, in which the key is the port
+	// we use the fact that each ports *must* be different between node
+	// this is ugly, yes, but simple and efficient
+	// (except it uselessly uses ~100kb of memory and we need to restrict port range)
 	if( !redisconnections ) {
 		unsigned long rc_size = sizeof(redisContext) * (max_port - min_port);
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Allocating %u kb\n", rc_size/1000);
@@ -310,7 +314,7 @@ static redisContext *get_redis_connection(const char *force_ip, int force_port) 
 	redisContext *redisconnection = redisconnections[port + min_port];
 
 	if(redisconnection) {
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: reuse connection for forced host:[%s] port:[%d] redisconnection:[%u]\n", force_ip, port, redisconnection);
+		//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: reuse connection for forced host:[%s] port:[%d] redisconnection:[%u]\n", force_ip, port, redisconnection);
 		if(redisconnection->err) {
 			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot connect to redis, err=%d, flags=0x%lx\n", __FUNCTION__,(int)redisconnection->err,(unsigned long)redisconnection->flags);
 			redisFree(redisconnection);
@@ -321,7 +325,7 @@ static redisContext *get_redis_connection(const char *force_ip, int force_port) 
 	}
 
 	if (!redisconnection) {
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: need a new connection for forced host:[%s] port:[%d]\n", force_ip, port);
+		//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: need a new connection for forced host:[%s] port:[%d]\n", force_ip, port);
 
 		if (!co) {
 			if (errmsg) {
@@ -400,13 +404,14 @@ static redisContext *get_redis_connection(const char *force_ip, int force_port) 
 	return redisconnection;
 }
 
+// Parse an error reply to detect 'MOVED' and 'ASK'
 static int parseReply(char *reply, char *host, int *port) {
 	// reply == "MOVED 14882 172.16.6.62:7004"
 	char* cmd;
 	char* host_port;
 	char* s;
 	cmd = strtok(reply, " ");
-	host_port = strtok(NULL, " ");
+	s = strtok(NULL, " ");
 	host_port = strtok(NULL, " ");
 	//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Cmd:[%s] Host/Port:[%s]\n", cmd, host_port);
 	if( strcmp(cmd, "MOVED") == 0 || strcmp(cmd, "ASK") == 0 ) {
@@ -427,6 +432,7 @@ static int parseReply(char *reply, char *host, int *port) {
 	return 0;
 }
 
+// Wrapper to catch MOVED and ASK replies and retry on given host
 static redisReply * redisClusterCommand(redisContext *rc, char *s) {
 	char host[256] = "\0";
 	int port;
@@ -456,7 +462,7 @@ static redisReply * redisClusterCommand(redisContext *rc, char *s) {
 					// Resend command over new connection
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "redisClusterCommand MOVED query:[%s]\n", s);
 					rget = (redisReply *) redisCommand(rc2, s);
-					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Got:[%s]\n", rget->str);
+					//TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Got:[%s]\n", rget->str);
 				}
 			} else {
 				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Error redisClusterCommand: %s\n", rget->str);
