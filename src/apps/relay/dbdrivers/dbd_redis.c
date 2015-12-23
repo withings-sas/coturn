@@ -60,13 +60,13 @@ struct _Ryconninfo {
 typedef struct _Ryconninfo Ryconninfo;
 
 
-struct redisClusterConnection {
+struct _redisClusterConnection {
 	redisContext *redisconnection;
-	char ip[1024];
+	char ip[257];
 	int port;
 };
 
-//typedef struct _redisClusterConnection redisClusterConnection;
+typedef struct _redisClusterConnection redisClusterConnection;
 
 
 static void RyconninfoFree(Ryconninfo *co) {
@@ -291,51 +291,40 @@ static redisContext *_redisConnect(Ryconninfo *co, char *ip, int port) {
 }
 
 static redisContext *get_redis_connection(char *ip, int port) {
-	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: get_redis_connection [%s:%d]\n", ip, port);
 	persistent_users_db_t *pud = get_persistent_users_db();
 
 	char *errmsg = NULL;
 	Ryconninfo *co = RyconninfoParse(pud->userdb, &errmsg);
 
-	struct redisClusterConnection *rccs = (struct redisClusterConnection*)pthread_getspecific(connection_key);
-	int max_connections = 30;
+	redisClusterConnection *rccs = (redisClusterConnection*)pthread_getspecific(connection_key);
+	int max_connections = 20;
 	if( !rccs ) {
-		unsigned long rc_size = sizeof(struct redisClusterConnection) * max_connections;
+		unsigned long rc_size = sizeof(redisClusterConnection) * max_connections;
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Allocating %u bytes\n", rc_size);
 		rccs = malloc(rc_size);
 		memset(rccs, 0, rc_size);
 	}
 	int i;
 	int rcc_index;
-	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Browse connections to find existing\n");
-	struct redisClusterConnection rcc;
+	redisClusterConnection rcc;
 	redisContext *redisconnection = NULL;
 	for( i=0; i<max_connections; i++ ) {
 		rcc = rccs[i];
 		if( strcmp(rcc.ip, ip) == 0 && rcc.port == port ) {
 			// Found match
 			rcc_index = i;
-			TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Found match at:[%d]\n", rcc_index);
 			redisconnection = rcc.redisconnection;
 			break;
 		}
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Connection\n");
 		if( rcc.port == 0 ) {
-			// Next slot
+			// Select available slot
 			rcc_index = i;
-			TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Select new slot at:[%d]\n", rcc_index);
 			break;
 		}
 	}
-	if( rcc_index == max_connections - 1 ) {
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Not enough slot:[%d/%d]\n", rcc_index, max_connections);
+	if( i == max_connections - 1 ) {
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Redis: Not enough slot:[%d/%d]\n", rcc_index, max_connections);
 		return NULL;
-	}
-	if( redisconnection == NULL ) {
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Redis: Write new slot at:[%d]\n", rcc_index);
-		rccs[rcc_index].redisconnection = redisconnection;
-		strcpy(rccs[rcc_index].ip, ip);
-		rccs[rcc_index].port = port;
 	}
 
 	if(redisconnection) {
@@ -345,6 +334,7 @@ static redisContext *get_redis_connection(char *ip, int port) {
 			redisFree(redisconnection);
 			redisconnection = NULL;
 			rccs[rcc_index].redisconnection = redisconnection;
+			strcpy(rccs[rcc_index].ip, "");
 			rccs[rcc_index].port = 0;
 			(void) pthread_setspecific(connection_key, rccs);
 		}
@@ -398,6 +388,8 @@ static redisContext *get_redis_connection(char *ip, int port) {
 		}
 		if(redisconnection) {
 			rccs[rcc_index].redisconnection = redisconnection;
+			strcpy(rccs[rcc_index].ip, ip);
+			rccs[rcc_index].port = port;
 			(void) pthread_setspecific(connection_key, rccs);
 		}
 	}
