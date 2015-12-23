@@ -510,11 +510,7 @@ static redisReply * redisClusterCommand(redisContext *rc, char *s) {
 static int set_redis_realm_opt(char *realm, const char* key, unsigned long *value)
 {
 	int found = 0;
-	*value = 0;
-	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Disabled set_redis_realm_opt: %s / %s\n", realm, key);
-	return found;
 
-	/*
 	redisContext *rc = get_redis_default_connection();
 
 	if(rc) {
@@ -542,7 +538,6 @@ static int set_redis_realm_opt(char *realm, const char* key, unsigned long *valu
 	}
 
 	return found;
-	*/
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -576,11 +571,11 @@ static int redis_get_auth_secrets(secrets_list_t *sl, u08bits *realm)
 }
   
 static int redis_get_user_key(u08bits *usname, u08bits *realm, hmackey_t key) {
-  int ret = -1;
+	int ret = -1;
 	redisContext * rc = get_redis_default_connection();
 	if(rc) {
 		char s[TURN_LONG_STRING_SIZE];
-		snprintf(s,sizeof(s),"get turn/realm/%s/user/%s/key", (char*)realm, usname);
+		snprintf(s,sizeof(s),"get turn/%s/user/%s", realm, usname);
 		//redisReply *rget = (redisReply *)redisCommand(rc, s);
 		redisReply *rget = (redisReply *)redisClusterCommand(rc, s);
 		if(rget) {
@@ -602,7 +597,7 @@ static int redis_get_user_key(u08bits *usname, u08bits *realm, hmackey_t key) {
 			turnFreeRedisReply(rget);
 		}
 	}
-  return ret;
+	return ret;
 }
 
 static int redis_get_oauth_key(const u08bits *kid, oauth_key_data_raw *key) {
@@ -648,7 +643,7 @@ static int redis_get_oauth_key(const u08bits *kid, oauth_key_data_raw *key) {
 }
   
 static int redis_set_user_key(u08bits *usname, u08bits *realm, const char *key) {
-  int ret = -1;
+	int ret = -1;
 	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char statement[TURN_LONG_STRING_SIZE];
@@ -657,7 +652,7 @@ static int redis_set_user_key(u08bits *usname, u08bits *realm, const char *key) 
 		turnFreeRedisReply(redisCommand(rc, "save"));
 		ret = 0;
 	}
-  return ret;
+	return ret;
 }
 
 static int redis_set_oauth_key(oauth_key_data_raw *key) {
@@ -675,7 +670,7 @@ static int redis_set_oauth_key(oauth_key_data_raw *key) {
 }
   
 static int redis_del_user(u08bits *usname, u08bits *realm) {
-  int ret = -1;
+	int ret = -1;
 	redisContext *rc = get_redis_default_connection();
 	if(rc) {
 		char statement[TURN_LONG_STRING_SIZE];
